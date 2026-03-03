@@ -27,6 +27,54 @@ class SmallBins;
 struct Decoder;
 };  // namespace tiering
 
+class FragmentRef {
+ public:
+  struct SerializationParams {
+    std::variant<std::array<std::string_view, 2>, uint8_t*> blob;
+    CompactObj::ExternalRep rep;
+  };
+
+  FragmentRef(PrimeValue& pv) : val_(&pv) {
+  }  // NOLINT
+
+  tiering::DiskSegment GetSegment() const {
+    return std::visit([](auto* pv) { return tiering::DiskSegment{pv->GetExternalSlice()}; }, val_);
+  }
+
+  bool IsOffloaded() const {
+    return std::visit([](auto* pv) { return pv->IsExternal(); }, val_);
+  }
+
+  bool HasStashPending() const {
+    return std::visit([](auto* pv) { return pv->HasStashPending(); }, val_);
+  }
+
+  CompactObjType ObjType() const {
+    return std::visit([](auto* pv) { return pv->ObjType(); }, val_);
+  }
+
+  void ClearStashPending() {
+    std::visit([](auto* pv) { pv->SetStashPending(false); }, val_);
+  }
+
+  // Returns a pointer to TieredColdRecord if this item is cool, and null otherwise.
+  tiering::TieredColdRecord* GetColdRecord() const;
+
+  // Resets tiering state for this fragment.
+  void ClearTiering() {
+    std::visit([](auto* pv) { pv->RemoveExternal(); }, val_);
+  }
+
+  SerializationParams GetSerializationParams() const {
+    return std::visit([](auto* pv) { return GetSerializationParamsInternal(pv); }, val_);
+  }
+
+ private:
+  static SerializationParams GetSerializationParamsInternal(const PrimeValue* pv);
+
+  std::variant<PrimeValue*> val_;
+};
+
 struct TieredStorageBase {
   // Min sizes of values taking up full page on their own
   const static size_t kMinOccupancySize = tiering::kPageSize / 2;
@@ -89,7 +137,7 @@ class TieredStorage : public TieredStorageBase {
                                                const StashDescriptor& blobs, bool provide_bp);
 
   // Delete value, must be offloaded (external type)
-  void Delete(DbIndex dbid, PrimeValue* value);
+  void Delete(DbIndex dbid, FragmentRef fragment_ref);
 
   // Cancel pending stash for the fragment, must have HasStashPending() true.
   void CancelStash(DbIndex dbid, std::string_view key, tiering::FragmentRef fragment_ref);
@@ -125,6 +173,9 @@ class TieredStorage : public TieredStorageBase {
   // Moves pv contents to the cool storage and updates pv to point to it.
   void CoolDown(DbIndex db_ind, std::string_view str, const tiering::DiskSegment& segment,
                 CompactObj::ExternalRep rep, PrimeValue* pv);
+
+  std::optional<TieredStorageBase::StashDescriptor> GetStashParams(
+      const FragmentRef& fragment_ref) const;
 
   PrimeValue DeleteCool(tiering::TieredColdRecord* record);
   tiering::TieredColdRecord* PopCool();

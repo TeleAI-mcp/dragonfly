@@ -797,7 +797,7 @@ OpStatus SetCmd::SetExisting(const SetParams& params, string_view value,
 
   // If value is external, mark it as deleted
   if (prime_value.IsExternal()) {
-    shard->tiered_storage()->Delete(op_args_.db_cntx.db_index, &prime_value);
+    shard->tiered_storage()->Delete(op_args_.db_cntx.db_index, FragmentRef{prime_value});
   }
 
   // overwrite existing entry.

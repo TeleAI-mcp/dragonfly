@@ -652,7 +652,7 @@ auto DbSlice::FindInternal(const Context& cntx, string_view key, optional<unsign
   // Rationale: we either look it up for reads - and then it's hot, or alternatively,
   // we follow up with modifications, so the pending stash becomes outdated.
   if (pv.HasStashPending()) {
-    owner_->tiered_storage()->CancelStash(cntx.db_index, key, &pv);
+    owner_->tiered_storage()->CancelStash(tiering::KeyRef(cntx.db_index, key), FragmentRef(pv));
   }
 
   // Fetch back cool items
@@ -1617,9 +1617,10 @@ void DbSlice::RemoveOffloadedEntriesFromTieredStorage(absl::Span<const DbIndex> 
     do {
       cursor = db_ptr->prime.Traverse(cursor, [&](PrimeIterator it) {
         if (it->second.IsExternal()) {
-          tiered_storage->Delete(index, &it->second);
+          tiered_storage->Delete(index, FragmentRef(it->second));
         } else if (it->second.HasStashPending()) {
-          tiered_storage->CancelStash(index, it->first.GetSlice(&scratch), &it->second);
+          tiered_storage->CancelStash(tiering::KeyRef(index, it->first.GetSlice(&scratch)),
+                                      FragmentRef(it->second));
         }
       });
     } while (cursor);
@@ -1828,9 +1829,10 @@ void DbSlice::PerformDeletionAtomic(const Iterator& del_it, const ExpIterator& e
   if (pv.HasStashPending()) {
     string scratch;
     string_view key = del_it->first.GetSlice(&scratch);
-    shard_owner()->tiered_storage()->CancelStash(table->index, key, &pv);
+    shard_owner()->tiered_storage()->CancelStash(tiering::KeyRef(table->index, key),
+                                                 FragmentRef(pv));
   } else if (pv.IsExternal()) {
-    shard_owner()->tiered_storage()->Delete(table->index, &del_it->second);
+    shard_owner()->tiered_storage()->Delete(table->index, FragmentRef(pv));
   }
 
   ssize_t value_heap_size = pv.MallocUsed(), key_size_used = del_it->first.MallocUsed();

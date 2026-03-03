@@ -58,7 +58,6 @@ namespace dfly {
 
 using namespace std;
 using namespace util;
-
 using tiering::FragmentRef;
 using tiering::KeyRef;
 using tiering::TieredColdRecord;
@@ -92,6 +91,16 @@ string SerializeToString(const TieredStorage::StashDescriptor& blobs) {
 }
 
 }  // anonymous namespace
+
+TieredColdRecord* FragmentRef::GetColdRecord() const {
+  return std::visit(
+      [](auto* pv) -> TieredColdRecord* {
+        if (pv->IsExternal() && pv->IsCool())
+          return pv->GetCool().record;
+        return nullptr;
+      },
+      val_);
+}
 
 size_t TieredStorage::StashDescriptor::EstimatedSerializedSize() const {
   return visit(
@@ -434,20 +443,16 @@ std::optional<util::fb2::Future<bool>> TieredStorage::Stash(DbIndex dbid, string
   return {};
 }
 
-void TieredStorage::Delete(DbIndex dbid, PrimeValue* value) {
-  DCHECK(value->IsExternal());
-  DCHECK(!value->HasStashPending());
-
+void TieredStorage::Delete(DbIndex dbid, FragmentRef fragment_ref) {
+  DCHECK(!fragment_ref.HasStashPending());
   ++stats_.total_deletes;
 
-  tiering::DiskSegment segment = value->GetExternalSlice();
-  if (value->IsCool()) {
-    auto hot = DeleteCool(value->GetCool().record);
+  tiering::DiskSegment segment = fragment_ref.GetSegment();
+  if (auto* cold = fragment_ref.GetColdRecord(); cold) {
+    auto hot = DeleteCool(cold);
     DCHECK_EQ(hot.ObjType(), OBJ_STRING);
   }
-
-  // In any case we delete the offloaded segment and reset the value.
-  value->RemoveExternal();
+  fragment_ref.ClearTiering();
   op_manager_->DeleteOffloaded(dbid, segment);
 }
 
