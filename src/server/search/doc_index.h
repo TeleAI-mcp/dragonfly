@@ -243,6 +243,7 @@ class ShardDocIndex {
     void Remove(DocId id);
 
     std::string_view Get(DocId id) const;
+    bool IsValid(DocId id) const;
     std::optional<DocId> Find(std::string_view key) const;
     size_t Size() const;
 
@@ -256,9 +257,6 @@ class ShardDocIndex {
 
     // Restore key-to-docId mappings from serialized data (RDB load)
     void Restore(const std::vector<std::pair<std::string, search::DocId>>& mappings);
-
-    // Restore from remapped keys in doc_id order (vector index = doc_id).
-    void Restore(const std::vector<std::string>& keys);
 
    private:
     absl::flat_hash_map<std::string, DocId> ids_;
@@ -357,11 +355,6 @@ class ShardDocIndex {
     key_index_.Restore(mappings);
   }
 
-  // Restore from remapped keys in doc_id order (vector index = doc_id).
-  void RestoreKeyIndex(const std::vector<std::string>& keys) {
-    key_index_.Restore(keys);
-  }
-
  private:
   // Clears internal data. Traverses all matching documents and assigns ids.
   void Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr, bool is_restored = false);
@@ -384,6 +377,12 @@ class ShardDocIndex {
   Synonyms synonyms_;
 
   std::unique_ptr<search::IndexBuilder> builder_;
+
+  // Set of document keys that were updated (via journal) while HNSW vector indices
+  // are being restored from serialized graph data. These are drained and re-applied
+  // after RestoreGlobalVectorIndices completes.
+  absl::flat_hash_set<std::string> pending_vector_updates_;
+  bool is_restoring_vectors_ = false;
 };
 
 // Stores shard doc indices by name on a specific shard.

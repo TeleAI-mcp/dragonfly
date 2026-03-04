@@ -378,8 +378,15 @@ struct HnswlibAdapter {
     DCHECK_EQ(world_.cur_element_count.load(), 0u)
         << "RestoreFromNodes should only be called on an empty index during deserialization";
 
-    // Ensure we have enough capacity
-    size_t required_capacity = metadata.cur_element_count;
+    // Ensure we have enough capacity.
+    // Metadata may have been captured before the snapshot read-lock, so
+    // cur_element_count can be smaller than actual node internal_ids when
+    // concurrent writes happen.  Compute the real requirement from nodes.
+    size_t max_internal_id = 0;
+    for (const auto& node : nodes) {
+      max_internal_id = std::max<size_t>(max_internal_id, node.internal_id);
+    }
+    size_t required_capacity = std::max(metadata.cur_element_count, max_internal_id + 1);
     if (world_.max_elements_ < required_capacity) {
       world_.resizeIndex(required_capacity);
     }

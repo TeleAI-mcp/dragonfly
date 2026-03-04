@@ -4122,8 +4122,47 @@ async def test_sbf_chunked_replication_over_4gb(df_factory: DflyInstanceFactory)
     assert await c_replica.execute_command("BF.EXISTS", "bf", "hello") == 1
 
 
-@pytest.mark.skip("HNSW index replication hasn't finished yet")
-@pytest.mark.large
+async def test_hnsw_search_replication_with_traffic_during_full_sync(
+    df_factory: DflyInstanceFactory,
+):
+    """
+    Test HNSW search index replication correctness when document mutations (adds, updates,
+    deletes) happen on the master during the full sync phase.
+
+    Journal events that modify indexed documents arrive at the replica while the HNSW
+    graph is being restored.  The pending_vector_updates_ buffer should capture them
+    and re-apply after RestoreGlobalVectorIndices completes.
+    """
+    master = df_factory.create(proactor_threads=4)
+    replica = df_factory.create(proactor_threads=4)
+    df_factory.start_all([master, replica])
+
+    c_master = master.client()
+    c_replica = replica.client()
+
+    seeder = HnswSearchSeeder(num_initial_docs=10000, num_dims=4)
+    await seeder.create_index(c_master)
+    await seeder.seed_initial_docs(c_master)
+
+    # Start continuous traffic before replication so journal events hit during full sync
+    traffic_task = asyncio.create_task(seeder.run_traffic(c_master, sleep_interval=0))
+
+    await c_replica.execute_command(f"REPLICAOF localhost {master.port}")
+
+    # Wait until replica is available (full sync done + index rebuilt)
+    await wait_available_async(c_replica)
+
+    seeder.stop()
+    await traffic_task
+
+    await check_all_replicas_finished([c_replica], c_master)
+
+    # Verify KNN search results match between master and replica
+    await seeder.verify(c_master, c_replica, num_queries=20)
+
+
+# @pytest.mark.skip("HNSW index replication hasn't finished yet")
+# @pytest.mark.large
 async def test_hnsw_search_replication_with_network_disruptions(
     df_factory: DflyInstanceFactory,
 ):
@@ -4172,7 +4211,9 @@ async def test_hnsw_search_replication_with_network_disruptions(
         logging.info(f"Replica FT.INFO: {info}")
 
         await check_all_replicas_finished([c_replica], c_master)
-        await seeder.verify(c_master, c_replica)
+        # HNSW is approximate — after independent mutations during stable sync
+        # the graph topology may differ, so we require at least 3/5 overlap.
+        await seeder.verify(c_master, c_replica, min_overlap=3)
 
     finally:
         seeder.stop()

@@ -301,7 +301,16 @@ class HnswSearchSeeder:
     def stop(self):
         self._stop_event.set()
 
-    async def verify(self, *clients: aioredis.Redis, num_queries=10):
+    async def verify(self, *clients: aioredis.Redis, num_queries=10, min_overlap=None):
+        """Verify KNN search results across clients.
+
+        Args:
+            clients: Redis clients to compare.
+            num_queries: Number of random KNN queries to run.
+            min_overlap: If None, require exact match of results.
+                         If set (e.g. 3), require at least that many common
+                         doc ids out of the top-k results per query.
+        """
         if len(clients) < 2:
             raise ValueError("Need at least two clients to compare")
 
@@ -312,10 +321,10 @@ class HnswSearchSeeder:
             ), f"dbsize mismatch: client[0]={sizes[0]} vs client[{i}]={sizes[i]}"
 
         # Verify HNSW search works and returns consistent results on all clients.
-        # For now we suppose that results should be 100% the same on all clients,
-        # in the future we can relax this assertion and check for some overlap in results instead,
-        # as HNSW is not deterministic and can return different results on different runs
-        for _ in range(num_queries):
+        # HNSW is an approximate algorithm — after independent mutations the graph
+        # topology may differ, so we optionally allow partial overlap instead of
+        # requiring exact match.
+        for q in range(num_queries):
             query_vec = self._make_embedding().tobytes()
             results = []
             for c in clients:
@@ -334,7 +343,14 @@ class HnswSearchSeeder:
                 doc_ids = sorted(r[i] for i in range(1, len(r), 2))
                 results.append((r[0], doc_ids))
             for i in range(1, len(results)):
-                assert results[0] == results[i]
+                if min_overlap is not None:
+                    common = set(results[0][1]) & set(results[i][1])
+                    assert len(common) >= min_overlap, (
+                        f"Query {q}: only {len(common)} common results "
+                        f"(need {min_overlap}): {results[0][1]} vs {results[i][1]}"
+                    )
+                else:
+                    assert results[0] == results[i]
             assert results[0][0] > 0, "KNN search returned no results"
 
     async def run_traffic(self, client: aioredis.Redis, sleep_interval=0.01):
@@ -362,7 +378,7 @@ class HnswSearchSeeder:
                 elif op == "delete":
                     key_id = random.randint(0, max(self._doc_counter - 1, 0))
                     await client.delete(f"{self.prefix}{key_id}")
-            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError):
+            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError, OSError):
                 await asyncio.sleep(sleep_interval)
             await asyncio.sleep(sleep_interval)
 
@@ -382,6 +398,6 @@ class HnswSearchSeeder:
                     "0",
                     "5",
                 )
-            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError):
+            except (redis.exceptions.ConnectionError, redis.exceptions.ResponseError, OSError):
                 pass
             await asyncio.sleep(sleep_interval)

@@ -251,6 +251,16 @@ string_view ShardDocIndex::DocKeyIndex::Get(DocId id) const {
   return keys_[id];
 }
 
+bool ShardDocIndex::DocKeyIndex::IsValid(DocId id) const {
+  if (id >= last_id_ || id >= keys_.size())
+    return false;
+  // Check if the key at this slot is still tracked in the reverse map with the same id.
+  // This correctly handles empty keys: freed slots have their key extracted from ids_,
+  // while valid empty-key docs still have ids_[""] == id.
+  auto it = ids_.find(keys_[id]);
+  return it != ids_.end() && it->second == id;
+}
+
 size_t ShardDocIndex::DocKeyIndex::Size() const {
   return ids_.size();
 }
@@ -293,16 +303,6 @@ void ShardDocIndex::DocKeyIndex::Restore(
   }
 }
 
-void ShardDocIndex::DocKeyIndex::Restore(const std::vector<std::string>& keys) {
-  DCHECK(ids_.empty()) << "Restore should only be called on an empty DocKeyIndex";
-  keys_.resize(keys.size());
-  for (DocId id = 0; id < static_cast<DocId>(keys.size()); ++id) {
-    keys_[id] = keys[id];
-    ids_[keys[id]] = id;
-  }
-  last_id_ = static_cast<DocId>(keys.size());
-}
-
 uint8_t DocIndex::GetObjCode() const {
   return type == JSON ? OBJ_JSON : OBJ_HASH;
 }
@@ -338,7 +338,11 @@ void ShardDocIndex::Rebuild(const OpArgs& op_args, PMR_NS::memory_resource* mr, 
   // the existing DocIds to add documents to the regular indices.
   if (!is_restored) {
     key_index_ = DocKeyIndex{};
+    // Full rebuild handles all documents — discard any buffered state from LOADING.
+    is_restoring_vectors_ = false;
+    pending_vector_updates_.clear();
   }
+
   indices_.emplace(base_->schema, base_->options, mr, &synonyms_);
 
   // Create builder and start indexing
@@ -447,6 +451,13 @@ void ShardDocIndex::RemoveDoc(DocId id, const DbContext& db_cntx, const PrimeVal
 
 void ShardDocIndex::AddDocToGlobalVectorIndex(ShardDocIndex::DocId doc_id, const DbContext& db_cntx,
                                               PrimeValue* pv) {
+  if (is_restoring_vectors_) {
+    // Buffer the key — will be re-applied after RestoreGlobalVectorIndices completes.
+    std::string_view key = key_index_.Get(doc_id);
+    pending_vector_updates_.emplace(key);
+    return;
+  }
+
   auto accessor = GetAccessor(db_cntx, *pv);
   GlobalDocId global_id = search::CreateGlobalDocId(EngineShard::tlocal()->shard_id(), doc_id);
 
@@ -463,6 +474,13 @@ void ShardDocIndex::AddDocToGlobalVectorIndex(ShardDocIndex::DocId doc_id, const
 
 void ShardDocIndex::RemoveDocFromGlobalVectorIndex(ShardDocIndex::DocId doc_id,
                                                    const DbContext& db_cntx, const PrimeValue& pv) {
+  if (is_restoring_vectors_) {
+    // Buffer the key — will be re-applied after RestoreGlobalVectorIndices completes.
+    std::string_view key = key_index_.Get(doc_id);
+    pending_vector_updates_.emplace(key);
+    return;
+  }
+
   auto accessor = GetAccessor(db_cntx, pv);
   GlobalDocId global_id = search::CreateGlobalDocId(EngineShard::tlocal()->shard_id(), doc_id);
 
@@ -532,6 +550,55 @@ void ShardDocIndex::RestoreGlobalVectorIndices(std::string_view index_name, cons
     VLOG(1) << "Restored vectors for index " << index_name << ": " << successful_updates << "/"
             << total_docs << " documents";
   }
+
+  // Drain pending vector updates that arrived via journal during the LOADING window.
+  // Clear the flag BEFORE draining so that AddDoc/AddDocToGlobalVectorIndex work normally.
+  is_restoring_vectors_ = false;
+  if (!pending_vector_updates_.empty()) {
+    LOG(INFO) << "Applying " << pending_vector_updates_.size()
+              << " pending vector updates for index '" << index_name << "' on shard "
+              << EngineShard::tlocal()->shard_id();
+
+    for (const auto& key : pending_vector_updates_) {
+      auto local_id = key_index_.Find(key);
+      auto it = db_slice.FindMutable(op_args.db_cntx, key, base_->GetObjCode());
+
+      if (it && IsValid(it->it)) {
+        // Key exists in DB — ensure it's properly indexed with current data.
+        PrimeValue& pv = it->it->second;
+
+        if (local_id) {
+          // Already in key_index_ (from snapshot restoration). The VectorLoop above called
+          // UpdateVectorData for all docs in key_index_, but this doc was modified via journal
+          // after VectorLoop processed it. Use UpdateVectorData (not Remove+Add) to refresh
+          // the vector data in-place, preserving the HNSW graph topology.
+          auto doc = GetAccessor(op_args.db_cntx, pv);
+          GlobalDocId global_id =
+              search::CreateGlobalDocId(EngineShard::tlocal()->shard_id(), *local_id);
+          for (const auto& [field_ident, field_info] : GetIndexedHnswFields(base_->schema)) {
+            if (auto index =
+                    GlobalHnswIndexRegistry::Instance().Get(index_name, field_info.short_name);
+                index) {
+              index->UpdateVectorData(global_id, *doc, field_ident);
+              if (!index->IsVectorCopied()) {
+                pv.SetOmitDefrag(true);
+              }
+            }
+          }
+        } else {
+          // New document — add to both regular indices and vector index.
+          auto doc_id = AddDoc(key, op_args.db_cntx, pv);
+          if (doc_id) {
+            AddDocToGlobalVectorIndex(*doc_id, op_args.db_cntx, &pv);
+          }
+        }
+      } else if (local_id) {
+        // Key absent from DB — remove stale entry from key_index_.
+        key_index_.Remove(*local_id);
+      }
+    }
+    pending_vector_updates_.clear();
+  }
 }
 
 ShardDocIndex::SerializedEntryWithKey ShardDocIndex::SerializeDocWithKey(
@@ -556,6 +623,11 @@ bool ShardDocIndex::Matches(string_view key, unsigned obj_code) const {
 
 optional<ShardDocIndex::LoadedEntry> ShardDocIndex::LoadEntry(DocId id,
                                                               const OpArgs& op_args) const {
+  // The doc may have been deleted between the global HNSW KNN search and the
+  // shard-local serialization hop. Return nullopt if the id is no longer valid.
+  if (!key_index_.IsValid(id))
+    return std::nullopt;
+
   auto& db_slice = op_args.GetDbSlice();
   string_view key = key_index_.Get(id);
   auto it = db_slice.FindReadOnly(op_args.db_cntx, key, base_->GetObjCode());
@@ -855,8 +927,16 @@ void ShardDocIndices::InitIndex(const OpArgs& op_args, std::string_view name,
 
   // Don't build while loading, shutting down, etc.
   // After loading, indices are rebuilt separately
-  if (ServerState::tlocal()->gstate() == GlobalState::ACTIVE)
+  if (ServerState::tlocal()->gstate() == GlobalState::ACTIVE) {
     it->second->Rebuild(op_args, &local_mr_);
+  } else if (ServerState::tlocal()->gstate() == GlobalState::LOADING) {
+    // During replication loading, journal events may modify documents with HNSW vectors
+    // while the HNSW graph is being restored. Buffer those mutations so they can be
+    // applied after index restoration completes in PerformPostLoad.
+    if (!std::ranges::empty(GetIndexedHnswFields(it->second->base_->schema))) {
+      it->second->is_restoring_vectors_ = true;
+    }
+  }
 
   op_args.GetDbSlice().SetDocDeletionCallback(
       [this](string_view key, const DbContext& cntx, const PrimeValue& pv) {
@@ -892,8 +972,8 @@ void ShardDocIndices::DropIndexCache(const dfly::ShardDocIndex& shard_doc_index)
 void ShardDocIndices::RebuildAllIndices(const OpArgs& op_args, bool is_restored) {
   for (auto& [index_name, ptr] : indices_) {
     // Only use the restore path for indices that have populated key mappings.
-    // When shard counts differ, PerformPostLoad remaps the mappings; if remapping fails,
-    // the mappings are removed so the index falls back to full rebuild here.
+    // Key mappings are only serialized for HNSW indices and only when shard counts match,
+    // so non-HNSW indices or mismatched-shard restores correctly fall back to full rebuild.
     bool index_restored = is_restored && ptr->key_index_.Size() > 0;
     ptr->Rebuild(op_args, &local_mr_, index_restored);
   }
@@ -923,6 +1003,10 @@ void ShardDocIndices::AddDoc(string_view key, const DbContext& db_cntx, PrimeVal
   DCHECK(IsIndexedKeyType(*pv));
   for (auto& [index_name, index] : indices_) {
     if (index->Matches(key, pv->ObjType())) {
+      if (index->is_restoring_vectors_) {
+        index->pending_vector_updates_.emplace(key);
+        continue;
+      }
       std::optional<search::DocId> doc_id = index->AddDoc(key, db_cntx, *pv);
       if (doc_id) {
         index->AddDocToGlobalVectorIndex(*doc_id, db_cntx, pv);
@@ -935,6 +1019,10 @@ void ShardDocIndices::RemoveDoc(string_view key, const DbContext& db_cntx, const
   DCHECK(IsIndexedKeyType(pv));
   for (auto& [index_name, index] : indices_) {
     if (index->Matches(key, pv.ObjType())) {
+      if (index->is_restoring_vectors_) {
+        index->pending_vector_updates_.emplace(key);
+        continue;
+      }
       std::optional<search::DocId> doc_id = index->GetDocId(key, db_cntx);
       if (doc_id) {
         index->RemoveDocFromGlobalVectorIndex(*doc_id, db_cntx, pv);
