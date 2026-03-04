@@ -138,7 +138,7 @@ class SliceSnapshot : public journal::JournalConsumerInterface {
   // Push serializer's internal buffer.
   // Push regardless of buffer size if force is true.
   // Return true if pushed. Can block. Is called from the snapshot thread.
-  bool PushSerialized(bool force);
+  bool PushSerialized(bool force, bool serialize_delayed_entries = true);
   void SerializeExternal(DbIndex db_index, PrimeKey key, const PrimeValue& pv, time_t expire_time,
                          uint32_t mc_flags);
 
@@ -148,9 +148,11 @@ class SliceSnapshot : public journal::JournalConsumerInterface {
   // plumbing and making it safe to move.
   void HandleFlushData(std::string data);
 
-  // Flush data from built in (or custom) serializer and pass it to HandleFlushData.
-  // Used for explicit flushes at safe points (e.g. between entries). Can block.
-  size_t FlushSerialized(RdbSerializer* serializer = nullptr /* use serializer_ */);
+  // Calls serializer_->Flush() to extract the remaining data from the serializer
+  // and process it via HandleFlushData().
+  // Used for explicit flushes at safe points (e.g. between entries).
+  // Can block.
+  size_t FlushSerialized();
 
   // An entry whose value must be awaited
 

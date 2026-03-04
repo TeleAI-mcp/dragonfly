@@ -453,32 +453,26 @@ void SliceSnapshot::HandleFlushData(std::string data) {
   VLOG(2) << "Pushed with Serialize() " << serialized;
 }
 
-size_t SliceSnapshot::FlushSerialized(RdbSerializer* serializer) {
-  if (serializer == nullptr) {
-    CHECK(delayed_entries_.empty());
-    serializer = serializer_.get();
-  }
-  std::string blob = serializer->Flush(SerializerBase::FlushState::kFlushEndEntry);
-
+size_t SliceSnapshot::FlushSerialized() {
+  std::string blob = serializer_->Flush(SerializerBase::FlushState::kFlushEndEntry);
   size_t serialized = blob.size();
   HandleFlushData(std::move(blob));
   return serialized;
 }
 
-bool SliceSnapshot::PushSerialized(bool force) {
+bool SliceSnapshot::PushSerialized(bool force, bool serialize_delayed_entries) {
   if (!force && serializer_->SerializedLen() < kMinBlobSize && delayed_entries_.size() < 32)
     return false;
 
-  size_t serialized = 0;
+  // Flush any of the leftovers to avoid interleavings
+  size_t serialized = FlushSerialized();
 
   // Atomic bucket serialization might have accumulated some delayed values.
   // Because we can finally block in this function, we'll await and serialize them
   thread_local LocalLatch delayed_flush_latch_;
-  while (!delayed_entries_.empty()) {
+  while (!delayed_entries_.empty() && serialize_delayed_entries) {
     // After pop_front there is no indication of the operation ongoing, so we need a latch
     std::unique_lock lk{delayed_flush_latch_};
-
-    RdbSerializer delayed_serializer{compression_mode_};
     do {
       // This code can run concurrently, so pop the entries one by one.
       // Because the keys never repeat (bucket visited once) order is not important.
@@ -499,16 +493,11 @@ bool SliceSnapshot::PushSerialized(bool force) {
 
       // TODO: to introduce RdbSerializer::SaveString that can accept a string value directly.
       PrimeValue pv{*res};
-      delayed_serializer.SaveEntry(entry.key, pv, entry.expire, entry.mc_flags, entry.dbid);
+      serializer_->SaveEntry(entry.key, pv, entry.expire, entry.mc_flags, entry.dbid);
     } while (!delayed_entries_.empty());
 
-    lk.unlock();
-    serialized += FlushSerialized(&delayed_serializer);
+    serialized += FlushSerialized();
   }
-
-  // Flush any of the leftovers to avoid interleavings
-  delayed_flush_latch_.Wait();
-  serialized += FlushSerialized();
 
   return serialized > 0;
 }
@@ -585,7 +574,8 @@ void SliceSnapshot::ConsumeJournalChange(const journal::JournalChangeItem& item)
 }
 
 void SliceSnapshot::ThrottleIfNeeded() {
-  PushSerialized(false);
+  // We can call this from Heartbeat, so we should skip serializing delayed entries
+  PushSerialized(false, false);
 }
 
 size_t SliceSnapshot::GetBufferCapacity() const {
